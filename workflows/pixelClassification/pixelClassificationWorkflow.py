@@ -117,7 +117,7 @@ class PixelClassificationWorkflow(Workflow):
         if slotId == "Predictions":
             return self.pcApplet.topLevelOperator.HeadlessPredictionProbabilities
         elif slotId == "PredictionsUint8":
-            return self.pcApplet.topLevelOperator.HeadlessPredictionProbabilitiesUint8
+            return self.pcApplet.topLevelOperator.HeadlessUint8PredictionProbabilities
         if slotId == "Batch_Predictions":
             return self.opBatchPredictor.PMaps
         
