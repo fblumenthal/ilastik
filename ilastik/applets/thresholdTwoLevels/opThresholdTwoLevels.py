@@ -206,7 +206,7 @@ class OpThresholdTwoLevels(Operator):
     HighThreshold = InputSlot(stype='float', value=0.5)
     LowThreshold = InputSlot(stype='float', value=0.2)
     SmootherSigma = InputSlot(value={ 'x':1.0, 'y':1.0, 'z':1.0})
-    Channel = InputSlot(value=2)
+    Channel = InputSlot(value=0)
     
     Output = OutputSlot()
     
@@ -289,6 +289,9 @@ class OpThresholdTwoLevels(Operator):
     def setupOutputs(self):
         pass
         
+    def setInSlot(self, slot, subindex, roi, value):
+        pass
+    
     def execute(self, slot, subindex, roi, destination):
         assert False, "Shouldn't get here."
     

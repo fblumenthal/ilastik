@@ -318,10 +318,16 @@ class ObjectClassificationGui(LabelingGui):
 
             print 'features:'
             feats = self.op.ObjectFeatures([t]).wait()[t]
-            featnames = feats[0].keys()
+            featnames = feats.keys()
             for featname in featnames:
                 print "{}:".format(featname)
-                value = channel[featname]
+                value = feats[featname]
                 ft = numpy.asarray(value.squeeze())[obj]
                 print ft
             print "------------------------------------------------------------"
+            
+    def setVisible(self, visible):
+        if visible:
+            self.op.triggerTransferLabels(self.op.current_view_index())
+        super(ObjectClassificationGui, self).setVisible(visible)
+        

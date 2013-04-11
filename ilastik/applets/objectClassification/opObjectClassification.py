@@ -1,6 +1,7 @@
 import numpy
 import vigra
 import warnings
+import itertools
 
 from lazyflow.graph import Operator, InputSlot, OutputSlot
 from lazyflow.stype import Opaque
@@ -97,6 +98,10 @@ class OpObjectClassification(Operator, MultiLaneOperatorABC):
 
         self.Eraser.setValue(100)
         self.DeleteLabel.setValue(-1)
+        
+        self._labelBBoxes = []
+        self._ambiguousLabels = []
+        self._needLabelTransfer = False
 
         def handleNewInputImage(multislot, index, *args):
             def handleInputReady(slot):
@@ -113,11 +118,13 @@ class OpObjectClassification(Operator, MultiLaneOperatorABC):
         self.LabelInputs[imageIndex].meta.dtype = object
         self.LabelInputs[imageIndex].meta.mapping_dtype = numpy.uint8
         self.LabelInputs[imageIndex].meta.axistags = None
+        
         self._resetLabelInputs(imageIndex)
 
     def _resetLabelInputs(self, imageIndex, roi=None):
         labels = dict()
         for t in range(self.SegmentationImages[imageIndex].meta.shape[0]):
+            #initialize, because volumina needs to reshape to use it as a datasink
             labels[t] = numpy.zeros((2,))
         self.LabelInputs[imageIndex].setValue(labels)
 
@@ -128,7 +135,10 @@ class OpObjectClassification(Operator, MultiLaneOperatorABC):
         pass
 
     def propagateDirty(self, slot, subindex, roi):
-        pass
+        if slot==self.SegmentationImages:
+            self._ambiguousLabels[subindex[0]] = self.LabelInputs[subindex[0]].value
+            self._needLabelTransfer = True
+            
 
     def assignObjectLabel(self, imageIndex, coordinate, assignedLabel):
         """
@@ -157,6 +167,133 @@ class OpObjectClassification(Operator, MultiLaneOperatorABC):
         labelsdict[timeCoord] = labels
         labelslot.setValue(labelsdict)
         labelslot.setDirty([(timeCoord, objIndex)])
+        
+        #Fill the cache of label bounding boxes, if it was empty
+        if len(self._labelBBoxes[imageIndex].keys())==0:
+            #it's the first label for this image
+            feats = self.ObjectFeatures[imageIndex]([timeCoord]).wait()
+            
+            #the bboxes should be the same for all channels
+            mins = feats[timeCoord]["Coord<Minimum>"+gui_features_suffix]
+            maxs = feats[timeCoord]["Coord<Maximum>"+gui_features_suffix]
+            bboxes = dict()
+            bboxes["Coord<Minimum>"]=mins
+            bboxes["Coord<Maximum>"]=maxs
+            self._labelBBoxes[imageIndex][timeCoord]=bboxes
+
+    def triggerTransferLabels(self, imageIndex):
+        if not self._needLabelTransfer:
+            return
+        if not self.SegmentationImages[imageIndex].ready():
+            return
+        if len(self._labelBBoxes[imageIndex].keys())==0:
+            #we either don't have any labels or we just read the project from file
+            #nothing to transfer
+            self._needLabelTransfer = False
+            return
+        
+        labels = dict()
+        for timeCoord in range(self.SegmentationImages[imageIndex].meta.shape[0]):
+            #we have to get new object features to get bounding boxes
+            print "Transferring labels to the new segmentation. This might take a while..."
+            new_feats = self.ObjectFeatures[imageIndex]([timeCoord]).wait()
+            coords = dict()
+            coords["Coord<Minimum>"]=new_feats[timeCoord]["Coord<Minimum>"+gui_features_suffix]
+            coords["Coord<Maximum>"]=new_feats[timeCoord]["Coord<Maximum>"+gui_features_suffix]
+            new_labels, old_labels_lost, new_labels_lost = self.transferLabels(self._ambiguousLabels[imageIndex][timeCoord], \
+                                             self._labelBBoxes[imageIndex][timeCoord], \
+                                            coords)
+            labels[timeCoord] = new_labels
+            
+            self._labelBBoxes[imageIndex][timeCoord]=coords
+            self._ambiguousLabels[imageIndex][timeCoord]=numpy.zeros((2,)) #initialize ambig. labels as normal labels
+            
+        self.LabelInputs[imageIndex].setValue(labels)
+        self._needLabelTransfer = False
+
+                
+    @staticmethod
+    def transferLabels(old_labels, old_bboxes, new_bboxes, axistags = None):
+        
+        mins_old = old_bboxes["Coord<Minimum>"]
+        maxs_old = old_bboxes["Coord<Maximum>"]
+        mins_new = new_bboxes["Coord<Minimum>"]
+        maxs_new = new_bboxes["Coord<Maximum>"]
+        nobj_old = mins_old.shape[0]
+        nobj_new = mins_new.shape[0]
+        if axistags is None:
+            axistags = "xyz"
+        class bbox():
+            def __init__(self, minmaxs, axistags):
+                self.xmin = minmaxs[0][axistags.index('x')]
+                self.ymin = minmaxs[0][axistags.index('y')]
+                self.zmin = minmaxs[0][axistags.index('z')]
+                self.xmax = minmaxs[1][axistags.index('x')]
+                self.ymax = minmaxs[1][axistags.index('y')]
+                self.zmax = minmaxs[1][axistags.index('z')]
+                self.rad_x = 0.5*(self.xmax - self.xmin)
+                self.cent_x = self.xmin+self.rad_x
+                self.rad_y = 0.5*(self.ymax-self.ymin)
+                self.cent_y = self.ymin+self.rad_y
+                self.rad_z = 0.5*(self.zmax-self.zmin)
+                self.cent_z = self.zmin+self.rad_z
+                
+            @staticmethod    
+            def overlap(bbox_tuple):
+                this = bbox_tuple[0]
+                that = bbox_tuple[1]
+                over_x = this.rad_x+that.rad_x - (abs(this.cent_x-that.cent_x))
+                over_y = this.rad_y+that.rad_y - (abs(this.cent_y-that.cent_y))
+                over_z = this.rad_z+that.rad_z - (abs(this.cent_z-that.cent_z))
+                
+                if over_x>0 and over_y>0 and over_z>0:
+                    return over_x*over_y*over_z
+                return 0
+                    
+        nonzeros = numpy.nonzero(old_labels)[0]
+        bboxes_old = [bbox(x, axistags) for x in zip(mins_old[nonzeros], maxs_old[nonzeros])]
+        bboxes_new = [bbox(x, axistags) for x in zip(mins_new, maxs_new)]
+        
+        #remove background
+        #FIXME: assuming background is 0 again
+        bboxes_new = bboxes_new[1:]
+        
+        double_for_loop = itertools.product(bboxes_old, bboxes_new)
+        overlaps = map(bbox.overlap, double_for_loop)
+        
+        overlaps = numpy.asarray(overlaps)
+        overlaps = overlaps.reshape((len(bboxes_old), len(bboxes_new)))
+        new_labels = numpy.zeros((nobj_new,), dtype=numpy.uint32)
+        old_labels_lost = dict()
+        old_labels_lost["full"]=[]
+        old_labels_lost["partial"]=[]
+        new_labels_lost = dict()
+        new_labels_lost["conflict"]=[]
+        for iobj in range(overlaps.shape[0]):
+            #take the object with maximum overlap
+            overlapsum = numpy.sum(overlaps[iobj, :])
+            if overlapsum==0:
+                old_labels_lost["full"].append((bboxes_old[iobj].cent_x, bboxes_old[iobj].cent_y, bboxes_old[iobj].cent_z))
+                continue
+            newindex = numpy.argmax(overlaps[iobj, :])
+            if overlapsum-overlaps[iobj,newindex]>0:
+                #this object overlaps with more than one new object
+                old_labels_lost["partial"].append((bboxes_old[iobj].cent_x, bboxes_old[iobj].cent_y, bboxes_old[iobj].cent_z))
+                
+            overlaps[iobj, :] = 0
+            overlaps[iobj, newindex] = 1 #doesn't matter what number>0
+            
+        for iobj in range(overlaps.shape[1]):
+            labels = numpy.where(overlaps[:, iobj]>0)[0]
+            if labels.shape[0]==1:
+                new_labels[iobj+1]=old_labels[nonzeros[labels[0]]] #iobj+1 because of the background
+            elif labels.shape[0]>1:
+                new_labels_lost["conflict"].append((bboxes_new[iobj].cent_x, bboxes_new[iobj].cent_y, bboxes_new[iobj].cent_z))
+        
+        new_labels = new_labels
+        new_labels[0]=0 #FIXME: hardcoded background value again
+        return new_labels, old_labels_lost, new_labels_lost
+            
 
     def addLane(self, laneIndex):
         numLanes = len(self.SegmentationImages)
@@ -164,11 +301,17 @@ class OpObjectClassification(Operator, MultiLaneOperatorABC):
         for slot in self.inputs.values():
             if slot.level > 0 and len(slot) == laneIndex:
                 slot.resize(numLanes + 1)
+                
+        self._ambiguousLabels.insert(laneIndex, None)
+        self._labelBBoxes.insert(laneIndex, dict())
 
     def removeLane(self, laneIndex, finalLength):
         for slot in self.inputs.values():
             if slot.level > 0 and len(slot) == finalLength + 1:
                 slot.removeSlot(laneIndex, finalLength)
+                
+        self._ambiguousLabels.pop(laneIndex)
+        self._labelBBoxes.pop(laneIndex)
 
     def getLane(self, laneIndex):
         return OperatorSubView(self, laneIndex)

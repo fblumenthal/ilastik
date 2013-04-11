@@ -1,12 +1,14 @@
 from PyQt4.QtGui import QWidget, QColor, QProgressDialog, QTreeWidgetItem, QMessageBox
 from PyQt4 import uic
-from PyQt4.QtCore import Qt, QString, QVariant
+from PyQt4.QtCore import Qt, QString, QVariant, pyqtSignal, QObject
 
 from lazyflow.rtype import SubRegion
 import os
 from collections import defaultdict
 
 from ilastik.applets.base.appletGuiInterface import AppletGuiInterface
+from functools import partial
+
 try:
     from ilastik.plugins import pluginManager
 except:
@@ -15,6 +17,7 @@ except:
 from volumina.api import LazyflowSource, GrayscaleLayer, RGBALayer, ConstantSource, \
                          LayerStackModel, VolumeEditor, VolumeEditorWidget, ColortableLayer
 import volumina.colortables as colortables
+from ilastik.widgets.viewerControls import ViewerControls
 
 import vigra
 import numpy as np
@@ -44,8 +47,6 @@ class FeatureSelectionDialog(QDialog):
         self.ui.allButton.pressed.connect(self.handleAll)
         self.ui.noneButton.pressed.connect(self.handleNone)
 
-        self.ui.treeWidget.clicked.connect(self.handleClick)
-
         self.ui.treeWidget.setColumnCount(1)
         for pluginName, features in featureDict.iteritems():
             parent = QTreeWidgetItem(self.ui.treeWidget)
@@ -55,18 +56,11 @@ class FeatureSelectionDialog(QDialog):
                 item = QTreeWidgetItem(parent)
                 item.setText(0, name)
                 item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
-                if name in self.selectedFeatures[pluginName]:
-                    item.setCheckState(0, Qt.Checked)
-                else:
-                    item.setCheckState(0, Qt.Unchecked)
-
-    def handleClick(self, index):
-        item = self.ui.treeWidget.itemFromIndex(index)
-        state = item.checkState(0)
-        if state == Qt.Checked:
-            item.setCheckState(0, Qt.Unchecked)
-        else:
-            item.setCheckState(0, Qt.Checked)
+                if pluginName in self.selectedFeatures:
+                    if name in self.selectedFeatures[pluginName]:
+                        item.setCheckState(0, Qt.Checked)
+                    else:
+                        item.setCheckState(0, Qt.Unchecked)
 
     def accept(self):
         QDialog.accept(self)
@@ -207,15 +201,7 @@ class ObjectExtractionGui(QWidget):
 
         # The editor's layerstack is in charge of which layer movement buttons are enabled
         model = self.editor.layerStack
-        model.canMoveSelectedUp.connect(self._viewerControlWidget.UpButton.setEnabled)
-        model.canMoveSelectedDown.connect(self._viewerControlWidget.DownButton.setEnabled)
-        model.canDeleteSelected.connect(self._viewerControlWidget.DeleteButton.setEnabled)
-
-        # Connect our layer movement buttons to the appropriate layerstack actions
-        self._viewerControlWidget.layerWidget.init(model)
-        self._viewerControlWidget.UpButton.clicked.connect(model.moveSelectedUp)
-        self._viewerControlWidget.DownButton.clicked.connect(model.moveSelectedDown)
-        self._viewerControlWidget.DeleteButton.clicked.connect(model.deleteSelected)
+        self._viewerControlWidget.setupConnections(model)
 
         self.editor._lastImageViewFocus = 0
 
@@ -227,9 +213,7 @@ class ObjectExtractionGui(QWidget):
         self._drawer.selectFeaturesButton.pressed.connect(self._selectFeaturesButtonPressed)
 
     def _initViewerControlUi(self):
-        p = os.path.split(__file__)[0]+'/'
-        if p == "/": p = "."+p
-        self._viewerControlWidget = uic.loadUi(p+"viewerControls.ui")
+        self._viewerControlWidget = ViewerControls(self)
 
     def _selectFeaturesButtonPressed(self):
         featureDict = {}
@@ -248,8 +232,19 @@ class ObjectExtractionGui(QWidget):
                                 QMessageBox.Ok)
             return
 
+        imgshape = list(self.mainOperator.RawImage.meta.shape)
+        axistags = self.mainOperator.RawImage.meta.axistags
+        imgshape.pop(axistags.index('t'))
+        fakeimg = np.empty(imgshape, dtype=np.float32)
+
+        labelshape = list(self.mainOperator.BinaryImage.meta.shape)
+        axistags = self.mainOperator.BinaryImage.meta.axistags
+        labelshape.pop(axistags.index('t'))
+        labelshape.pop(axistags.index('c') - 1)
+        fakelabels = np.empty(labelshape, dtype=np.uint32)
+
         for pluginInfo in plugins:
-            featureDict[pluginInfo.name] = pluginInfo.plugin_object.availableFeatures()
+            featureDict[pluginInfo.name] = pluginInfo.plugin_object.availableFeatures(fakeimg, fakelabels)
         dlg = FeatureSelectionDialog(featureDict=featureDict,
                                      selectedFeatures=selectedFeatures)
         dlg.exec_()
@@ -259,28 +254,51 @@ class ObjectExtractionGui(QWidget):
             self._calculateFeatures()
 
     def _calculateFeatures(self):
-        maxt = self.mainOperator.LabelImage.meta.shape[0]
-        progress = QProgressDialog("Calculating features...", "Stop", 0, maxt)
-        progress.setWindowModality(Qt.ApplicationModal)
-        progress.setMinimumDuration(0)
-        progress.setCancelButtonText(QString())
-
-        reqs = []
-        self.mainOperator._opRegFeats.fixed = False
-        for t in range(maxt):
-            reqs.append(self.mainOperator.RegionFeatures([t]))
-            reqs[-1].submit()
-
-        for i, req in enumerate(reqs):
-            progress.setValue(i)
-            if progress.wasCanceled():
-                req.cancel()
-            else:
-                req.wait()
-
-        self.mainOperator._opRegFeats.fixed = True
-        progress.setValue(maxt)
-
         self.mainOperator.ObjectCenterImage.setDirty(SubRegion(self.mainOperator.ObjectCenterImage))
 
-        print 'Object Extraction: done.'
+        maxt = self.mainOperator.LabelImage.meta.shape[0]
+        progress = QProgressDialog("Calculating features...", "Cancel", 0, maxt)
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        # We will use notify_finished() to update the progress bar.
+        # However, the callback will be called from a non-gui thread,
+        # which cannot access gui elements directly. Therefore we use
+        # this callback object to send signals back to this thread.
+        class Callback(QObject):
+            ndone = 0
+            timestep_done = pyqtSignal(int)
+            all_finished = pyqtSignal()
+
+            def __call__(self, *args, **kwargs):
+                self.ndone += 1
+                self.timestep_done.emit(self.ndone)
+                if self.ndone == len(reqs):
+                    self.all_finished.emit()
+        callback = Callback()
+
+        def updateProgress(progress, n):
+            progress.setValue(n)
+        callback.timestep_done.connect(partial(updateProgress, progress))
+
+        def finished():
+            self.mainOperator._opRegFeats.fixed = True
+            print 'Object Extraction: done.'
+        callback.all_finished.connect(finished)
+
+        self.mainOperator._opRegFeats.fixed = False
+        reqs = []
+        for t in range(maxt):
+            req = self.mainOperator.RegionFeatures([t])
+            req.submit()
+            reqs.append(req)
+
+        for i, req in enumerate(reqs):
+            req.notify_finished(callback)
+
+        # handle cancel button
+        def cancel():
+            for req in reqs:
+                req.cancel()
+        progress.canceled.connect(cancel)
