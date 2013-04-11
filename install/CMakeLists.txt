@@ -2,6 +2,7 @@ CMAKE_MINIMUM_REQUIRED(VERSION 2.8.6)
 project (Ilastik)
 
 include (ExternalProject)
+#include (TemplateSupport)
 
 ############################################################################
 # Check if BUILDEM_DIR has already been assigned.  If not, create a default.
@@ -22,7 +23,7 @@ if (NOT EXISTS ${BUILDEM_REPO_DIR}/python.cmake)
     message ("Installing buildem repo...")
     ExternalProject_Add(buildem
         PREFIX              ${BUILDEM_DIR}
-        GIT_REPOSITORY      https://github.com/JensNRAD/buildem.git
+        GIT_REPOSITORY      https://github.com/fblumenthal/buildem.git
         #GIT_TAG            python3  # Example of tagged branch (see doc)
         UPDATE_COMMAND      ""
         PATCH_COMMAND       ""
@@ -52,7 +53,35 @@ else ()
         COMMENT "Installed all required software using buildem.")
 
     # Install Foo -- actual build commands should go below
-    # add_executable(...)
 
+    configure_file(${TEMPLATE_DIR}/ilastik_final.in ${BUILDEM_DIR}/ilastik_final)
+
+    #INSTALL(FILES ${BUILDEM_DIR}/ilastik_final DESTINATION bin)
+    INSTALL(PROGRAMS ${BUILDEM_DIR}/ilastik_final DESTINATION . )
+    INSTALL(DIRECTORY ${BUILDEM_DIR}/bin DESTINATION . USE_SOURCE_PERMISSIONS)
+    INSTALL(DIRECTORY ${BUILDEM_DIR}/lib DESTINATION .)
+    INSTALL(DIRECTORY ${BUILDEM_DIR}/include DESTINATION .)
+    INSTALL(DIRECTORY ${BUILDEM_DIR}/src/volumina-flyem-20130221 DESTINATION src/)
+    INSTALL(DIRECTORY ${BUILDEM_DIR}/src/lazyflow-flyem-20130221 DESTINATION src/)
+    INSTALL(DIRECTORY ${BUILDEM_DIR}/src/ilastik-flyem-20130221 DESTINATION src/)
+
+    SET(CPACK_GENERATOR "TGZ")
+
+    SET(CPACK_PACKAGE_VENDOR "Heidelberg Collaboratory for Image Processing")
+    SET(CPACK_PACKAGE_DESCRIPTION_SUMMARY
+      "Interactive image labeling and segmentation toolkit."
+      )
+    
+    SET(CPACK_PACKAGE_VERSION_MAJOR "0")
+    SET(CPACK_PACKAGE_VERSION_MINOR "6")
+    SET(CPACK_PACKAGE_VERSION_PATCH "a")
+    
+    #SET(CPACK_PACKAGE_INSTALL_DIRECTORY     "${PROJECT_NAME}-0.6.a")
+
+    SET(CPACK_STRIP_FILES TRUE)
+    #SET(CPACK_PACKAGE_CONTACT "ilastik Team <team@ilastik.org>")
+    
+    INCLUDE (CPack)
+    
 ############################################################################
 endif()
