@@ -23,4 +23,6 @@ If this is the first time an application was compiled for this BPD, the build sc
 % cmake -D BUILDEM_DIR=/path/to/BPD  /path/to/foo/code
 % make
 
+To build the binary package run:
 
+%cpack -C CPackConfig.cmake
